@@ -1,0 +1,182 @@
+# Публикация в Maven Central по тегу N.N.N (или N.N.N-suffix).
+#
+# Две джобы:
+#
+#   test (ubuntu-latest) — быстрый гейт: JVM-тесты (JNI-путь, включая pty) и
+#     linuxX64Test. Linux-тестовый бинарь нельзя запустить на macOS, поэтому
+#     это единственный хост, где реально исполняется Kotlin/Native-тест.
+#
+#   publish (macos-14) — релизный хост. macOS — единственная платформа, где
+#     Kotlin/Native собирает Apple-таргеты (macosArm64/macosX64), и оттуда же
+#     кросс-собираются linuxX64/linuxArm64/mingwX64 (нужны только чужие
+#     jni_md.h). Так вся публикация уходит одним Sonatype-деплойментом.
+#
+# Соглашения — как в остальных caffeine-mgn/*: GPG-ключ импортируется в
+# системный keyring один раз в начале джобы, `signingUseGpg` переключает
+# подпись на `useGpgCmd()`, токен Sonatype и GPG-параметры пробрасываются
+# через `-P`-свойства.
+
+name: Release to Maven Central
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+env:
+  KONAN_VERSION: "2.4.20"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux-гейт: единственный хост, который умеет *запускать* linuxX64-тесты.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang mingw-w64 socat
+
+      - name: Run JVM tests (incl. pty integration)
+        run: ./gradlew jvmTest -Dserial.integration=true --stacktrace
+
+      # Нативный pty-тест открывает /tmp/ttyA и /tmp/ttyB — поднимаем пару
+      # через socat, иначе тест сам себя пропустит.
+      - name: Start pty pair for native tests
+        run: |
+          socat pty,raw,echo=0,link=/tmp/ttyA pty,raw,echo=0,link=/tmp/ttyB &
+          sleep 1
+          ls -l /tmp/ttyA /tmp/ttyB
+
+      - name: Run Linux native tests
+        run: ./gradlew linuxX64Test --stacktrace
+
+  # ---------------------------------------------------------------------------
+  # Публикация: macOS-хост (Apple + все кросс-таргеты), один Central-деплой.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: test
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Кросс-сборка JVM-библиотеки под linux/mingw на macOS требует чужих
+      # jni_md.h: в macOS-JDK есть только darwin-версия. jni.h общий, платформенный
+      # только jni_md.h — кладём его туда, где его ищет build.gradle.kts
+      # (build/jni-include/<platform>/). Без этого linux/mingw-задачи молча
+      # пропускаются и в jar не попадают нужные .so/.dll.
+      - name: Provision cross JNI headers (linux/win32 jni_md.h)
+        run: |
+          set -euo pipefail
+          mkdir -p build/jni-include/linux build/jni-include/win32
+          curl -fsSL "https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/include/jni_md.h" \
+            -o build/jni-include/linux/jni_md.h
+          curl -fsSL "https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/windows/native/include/jni_md.h" \
+            -o build/jni-include/win32/jni_md.h
+          ls -l build/jni-include/*/jni_md.h
+
+      - name: Import GPG key
+        env:
+          GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSWORD }}
+        run: |
+          set -euo pipefail
+          command -v gpg >/dev/null 2>&1 || brew install gnupg
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          gpgconf --reload gpg-agent
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" --import
+          else
+            printf '%b' "$GPG_KEY" | gpg --batch --yes --pinentry-mode loopback --import
+          fi
+          gpg --list-secret-keys --with-colons | grep -q '^sec' && echo "GPG key imported"
+
+      - name: Run JVM tests
+        run: ./gradlew jvmTest --stacktrace
+
+      # JVM-jar должен нести нативную библиотеку под каждую поддерживаемую ОС:
+      # именно её NativeLoader распаковывает и грузит в рантайме. Если
+      # кросс-сборка выше сломалась, потребитель на этой ОС получит jar,
+      # падающий на System.load, — поэтому проверяем payload до публикации.
+      - name: Verify JVM jar carries every host native library
+        run: |
+          set -euo pipefail
+          ./gradlew jvmJar --stacktrace
+          JAR="$(find build -type f -name 'serial-jvm-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -1)"
+          if [ -z "$JAR" ]; then
+            echo "ERROR: no JVM jar found; jars under build/:"
+            find build -name '*.jar' | head -20
+            exit 1
+          fi
+          echo "jar: $JAR"
+          rm -rf /tmp/jar-payload && mkdir -p /tmp/jar-payload
+          unzip -o -q "$JAR" -d /tmp/jar-payload
+          fail=0
+          for entry in \
+            native/linux-x64/libserialjvm.so \
+            native/linux-arm64/libserialjvm.so \
+            native/macos-x64/libserialjvm.dylib \
+            native/macos-arm64/libserialjvm.dylib \
+            native/windows-x64/libserialjvm.dll
+          do
+            path="/tmp/jar-payload/$entry"
+            if [ ! -f "$path" ]; then
+              echo "ERROR: missing $entry"
+              fail=1
+              continue
+            fi
+            echo "== $entry"
+            file "$path"
+          done
+          file /tmp/jar-payload/native/linux-x64/libserialjvm.so   | grep -q 'ELF 64-bit'      || { echo "ERROR: linux-x64 payload is not ELF"; fail=1; }
+          file /tmp/jar-payload/native/linux-arm64/libserialjvm.so | grep -q 'ELF 64-bit'      || { echo "ERROR: linux-arm64 payload is not ELF"; fail=1; }
+          file /tmp/jar-payload/native/macos-arm64/libserialjvm.dylib | grep -q 'Mach-O'      || { echo "ERROR: macos-arm64 payload is not Mach-O"; fail=1; }
+          file /tmp/jar-payload/native/macos-x64/libserialjvm.dylib   | grep -q 'Mach-O'      || { echo "ERROR: macos-x64 payload is not Mach-O"; fail=1; }
+          file /tmp/jar-payload/native/windows-x64/libserialjvm.dll   | grep -qE 'PE32|MS Windows' || { echo "ERROR: windows-x64 payload is not a PE binary"; fail=1; }
+          exit $fail
+
+      - name: Repository hygiene (no build outputs tracked)
+        run: test "$(git ls-files | grep -cE '^(build|\.gradle)/')" = "0"
+
+      - name: Publish to Maven Central
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
+        run: |
+          ./gradlew publishToMavenCentral \
+            -Pversion=${{ github.ref_name }} \
+            -PsigningUseGpg=true \
+            -Psigning.gnupg.keyName="$GPG_KEY_ID" \
+            -Psigning.gnupg.passphrase="$GPG_PASSWORD" \
+            -PmavenCentralUsername=${{ secrets.CENTRAL_USERNAME }} \
+            -PmavenCentralPassword=${{ secrets.CENTRAL_PASSWORD }}

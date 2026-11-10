@@ -1,0 +1,60 @@
+# Continuous integration: обычные push'и и pull request'ы.
+#
+# Прогоняет тот же гейт, что и release-workflow перед публикацией:
+# JVM-тесты (JNI-путь к нативному ядру, включая интеграционный тест через pty)
+# и linuxX64Test (Kotlin/Native-путь через cinterop).
+#
+# Публикация живёт в release.yml и запускается только по тегу.
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  KONAN_VERSION: "2.4.20"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # gcc/clang собирают C-ядро и JNI-обёртку, mingw-w64 — кросс-сборку
+      # Windows-DLL, которая кладётся в JVM-jar, socat — pty для интеграционного
+      # теста порта.
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang mingw-w64 socat
+
+      - name: Run JVM tests (incl. pty integration)
+        run: ./gradlew jvmTest -Dserial.integration=true --stacktrace
+
+      # Нативный pty-тест открывает /tmp/ttyA и /tmp/ttyB — поднимаем пару
+      # через socat, иначе тест сам себя пропустит.
+      - name: Start pty pair for native tests
+        run: |
+          socat pty,raw,echo=0,link=/tmp/ttyA pty,raw,echo=0,link=/tmp/ttyB &
+          sleep 1
+          ls -l /tmp/ttyA /tmp/ttyB
+
+      - name: Run Linux native tests
+        run: ./gradlew linuxX64Test --stacktrace
+
+      - name: Kotlin style
+        run: ./gradlew ktlintCheck --stacktrace

@@ -159,10 +159,14 @@ target: linux aarch64`. ARM-Linux есть только среди *таргет
    На Pi прогон даёт `7 tests, PASSED` — включая pty-петлю через своё C.
 4. На ARM-хосте кросс в mingw отключается автоматически (нет тулчейна).
 
-## 9. CI/CD: публикация в Nexus
+## 9. CI/CD: GitHub Actions → Maven Central
 
-Workflow — `.gitea/workflows/release.yml`. Триггер — **объект релиза** в Gitea
-(`release: published`), не голый `git push --tags`.
+Два workflow'а в `.github/workflows/`:
+
+| Файл | Триггер | Что делает |
+|---|---|---|
+| `ci.yml` | push в `main`, pull request | `jvmTest -Dserial.integration=true` (pty через socat), `linuxX64Test`, `ktlintCheck` на `ubuntu-latest` |
+| `release.yml` | тег `N.N.N` | гейт на ubuntu → публикация с `macos-latest` |
 
 ### ⚠️ Обязательный флаг сборки
 
@@ -174,125 +178,70 @@ kotlin.mpp.enableCInteropCommonization=true
 Без него `compileNativeMainKotlinMetadata` не видит символы cinterop и падает с
 `Unresolved reference 'core'` на каждом импорте `pw.binom.serial.core.*`.
 **Публикация при этом мертва целиком** — при живых тестах и живых таргетах.
-Это была настоящая причина, по которой `publish` не проходил.
 
-### Переменные репозитория (обязательно ДО релиза)
+### Почему публикует macos-latest
 
-`BINOM_REPO_*` живут на уровне **репозитория**, не глобально. У нового репо их нет,
-и публикация уходит анонимно → падает. Заводить:
+Apple-таргеты (`macosX64`, `macosArm64`) собираются только на macOS: cinterop не
+кросс-компилируется в Apple-семейство. macOS-раннер при этом умеет кросс-собрать
+и все остальные таргеты, поэтому публикация — один Central-деплой из одной джобы:
 
-```bash
-AUTH="-u subochev:<PASS>"; BASE="https://git.binom.pw/api/v1"
-for n in BINOM_REPO_URL BINOM_REPO_USER BINOM_REPO_PASSWORD; do ... done
-# 201 создано, 409 уже есть (тогда PUT), 204 обновлено
-```
-
-Проверка: `GET /repos/subochev/serial-kmp/actions/variables` → три записи.
-
-### Что публикуется, а что нет
-
-| Таргет | С раннера (Linux x86_64) |
+| Таргет | С macos-latest |
 |---|---|
 | `jvm` | да |
-| `linuxX64` | да |
+| `linuxX64` | да (кросс) |
 | `linuxArm64` | да (кросс) |
 | `mingwX64` | да (кросс) |
-| `macosX64` | **нет** — cinterop не кросс-компилируется в Apple |
-| `macosArm64` | **нет**, по той же причине |
+| `macosX64` | да |
+| `macosArm64` | да |
 
-Проверено локально: `publishToMavenLocal -Pversion=7` даёт **5 артефактов**
-(`serial-kmp`, `-jvm`, `-linuxx64`, `-linuxarm64`, `-mingwx64`). Apple-артефактов
-в списке нет — это не поломка, а ограничение Kotlin/Native.
+Кросс-сборка JVM-библиотеки под linux/mingw требует чужих `jni_md.h` — в
+macOS-JDK есть только `darwin`. Workflow качает два заголовка из `jdk21u` в
+`build/jni-include/{linux,win32}/`, откуда их берёт `build.gradle.kts`.
+Перед публикацией отдельный шаг проверяет, что в `serial-jvm-*.jar` лежат все
+пять нативных библиотек (`native/<os>-<arch>/libserialjvm.*`) — иначе потребитель
+на этой ОС получит jar, падающий на `System.load`.
 
-Apple-артефакты, если понадобятся, выпускаются отдельным прогоном на macOS-хосте.
+### Секреты репозитория
+
+Задаются один раз (скрипт скилла `maven-central-publish`):
+
+```bash
+~/.config/opencode/skills/maven-central-publish/scripts/gh-secrets.sh caffeine-mgn/serial-kmp
+```
+
+`GPG_PRIVATE_KEY`, `GPG_KEY_ID`, `GPG_PASSWORD`, `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`.
 
 ### Порядок выпуска
 
 ```bash
-git add -A && git commit -m "..." && git push origin main
-# затем ОБЪЕКТ релиза (не тег):
-curl -sL -u "subochev:<PASS>" -X POST \
-  "https://git.binom.pw/api/v1/repos/subochev/serial-kmp/releases" \
-  -H "Content-Type: application/json" \
-  -d '{"tag_name":"1","target_commitish":"main","name":"1","body":"...","draft":false}'
+git tag 1.0.0 && git push origin 1.0.0
 ```
 
-Проверка факта в Nexus:
+Версия берётся из имени тега (`GITHUB_REF_NAME`). Если прогон сломался —
+поправь workflow, **удали и пересоздай тег**, чтобы не запускать два релиза
+параллельно:
 
 ```bash
-curl -s "http://192.168.76.117/service/rest/v1/search?repository=caffeine&group=pw.binom.serial" \
-  | python3 -c "import sys,json;print([i['version'] for i in json.load(sys.stdin).get('items',[])])"
+git tag -d 1.0.0 && git push origin :refs/tags/1.0.0
+git tag 1.0.0 && git push origin 1.0.0
 ```
 
-## 10. Мак-раннер Gitea (`macos-arm64`)
-
-Установлен на `Mac-mini-Anton` (mac.xx, M1), чтобы собирать Apple-таргеты, которые
-на Linux невозможны.
-
-| Параметр | Значение |
-|---|---|
-| `act_runner` | v0.2.11, darwin-arm64 |
-| Каталог | `~/runners/gitea-serial/` |
-| Имя в Gitea | `mac-mini-serial` (id=6) |
-| Лейбл | **`macos-arm64:host`** |
-| Область | **user-level** — работает для ВСЕХ репозиториев пользователя |
-| JAVA_HOME | Corretto 21 |
-
-### ⚠️ Запуск: только `nohup`, launchd не работает
-
-Мак **headless** — GUI-сессии нет (`stat -f "%Su" /dev/console` → `root`). Поэтому
-`launchctl bootstrap user/501 <plist>` падает с `Bootstrap failed: 5: Input/output
-error`, и простая загрузка plist'а тоже не поднимает демон. При этом
-`launchctl print user/501` показывает службу как `enabled` — ложное ощущение успеха.
-
-Рабочий способ:
+### Проверка результата
 
 ```bash
-cd ~/runners/gitea-serial
-nohup ./act_runner daemon > /tmp/gitea-runner.log 2>&1 &
+source ~/.config/opencode/skills/maven-central-publish/scripts/creds.env
+curl -s -u "$CENTRAL_USER:$CENTRAL_PASSWORD" \
+  "https://central.sonatype.com/api/v1/publisher/deployments?pageSize=3" \
+  | python3 -c "import json,sys;[print(x['deploymentName'],x['deploymentState']) for x in json.load(sys.stdin)['deployments']]"
+# PUBLISHED (15-25 минут после успешной загрузки), затем:
+curl -I https://repo1.maven.org/maven2/pw/binom/serial/1.0.0/serial-1.0.0.pom   # 200
 ```
 
-Проверка, что раннер поднялся:
+### Локальная сборка для потребителей
+
+`publishToMavenLocal` не требует ключей и публикует `pw.binom:serial:<версия>`
+в `~/.m2` — этим пользуется, например, `proxy-bridge` при отладке:
 
 ```bash
-curl -s -u subochev:<PASS> https://git.binom.pw/api/v1/user/actions/runners \
-  | python3 -c "import sys,json;[print(r['name'],r['status']) for r in json.load(sys.stdin)['runners']]"
-# ожидаем: mac-mini-serial online
+./gradlew publishToMavenLocal -Pversion=1.0.0
 ```
-
-⚠️ После перезагрузки мака раннер **не поднимется сам** — `nohup` не переживает
-ребут. Нужен либо GUI-логин (тогда заработает launchd), либо ручной запуск.
-
-### ⚠️ `~/.gradle/gradle.properties` перекрывает дефолт URL публикации
-
-У пользователя в `~/.gradle/gradle.properties` лежит:
-
-```
-binom.repo.url=https://repo.binom.pw/
-binom.repo.user=subochev
-```
-
-Это **перекрывает** дефолт в `build.gradle.kts` (`http://nexus.xx/repository/caffeine/`).
-Публикация уходит на `repo.binom.pw` и падает с **401 Unauthorized**.
-
-Проверка и обход:
-
-```bash
-./gradlew   -Pbinom.repo.url=http://nexus.xx/repository/caffeine/   -Pbinom.repo.user=admin -Pbinom.repo.password=admin123   publishMacosArm64PublicationToCaffeineRepository
-```
-
-В CI этой проблемы нет: composite-action передаёт `-Pbinom.repo.*` явно из
-Action Variables.
-
-### Что публикует мак-джоба
-
-```yaml
-- run: ./gradlew -Pversion=${{ gitea.ref_name }} \
-    -Pbinom.repo.user="$BINOM_REPO_USER" \
-    -Pbinom.repo.password="$BINOM_REPO_PASSWORD" \
-    publishMacosX64PublicationToCaffeineRepository \
-    publishMacosArm64PublicationToCaffeineRepository
-```
-
-Проверено живьём 31.10.2026: оба артефакта легли в Nexus (`HTTP 200` на POM),
-затем тестовая версия удалена по `componentId`.

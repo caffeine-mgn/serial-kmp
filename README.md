@@ -114,8 +114,17 @@ export JAVA_HOME=/path/to/jdk21          # kn-clang requires JVM 21
 ```
 
 Apple targets can only be compiled on a macOS host — a Kotlin/Native
-limitation, not a library one. See [TESTING.md](./TESTING.md) for the
-integration test setup (pty loopback via `socat`).
+limitation, not a library one.
+
+The integration tests open a pty pair, so run them with `socat` up:
+
+```bash
+socat pty,raw,echo=0,link=/tmp/ttyA pty,raw,echo=0,link=/tmp/ttyB &
+./gradlew jvmTest -Dserial.integration=true
+./gradlew linuxX64Test
+```
+
+Without the pty pair the native test skips itself.
 
 ## Releasing
 

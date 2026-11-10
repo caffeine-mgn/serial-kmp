@@ -118,8 +118,18 @@ export JAVA_HOME=/path/to/jdk21          # kn-clang требует JVM 21
 ```
 
 Apple-таргеты собираются только на macOS-хосте — это ограничение
-Kotlin/Native, а не библиотеки. Настройка интеграционных тестов (петля pty
-через `socat`) — в [TESTING.md](./TESTING.md).
+Kotlin/Native, а не библиотеки.
+
+Интеграционные тесты открывают pty-пару, поэтому запускайте их с поднятым
+`socat`:
+
+```bash
+socat pty,raw,echo=0,link=/tmp/ttyA pty,raw,echo=0,link=/tmp/ttyB &
+./gradlew jvmTest -Dserial.integration=true
+./gradlew linuxX64Test
+```
+
+Без pty-пары нативный тест пропускается сам.
 
 ## Релиз
 

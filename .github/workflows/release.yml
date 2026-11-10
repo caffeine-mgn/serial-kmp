@@ -6,7 +6,7 @@
 #     linuxX64Test. Linux-тестовый бинарь нельзя запустить на macOS, поэтому
 #     это единственный хост, где реально исполняется Kotlin/Native-тест.
 #
-#   publish (macos-14) — релизный хост. macOS — единственная платформа, где
+#   publish (macos-latest) — релизный хост. macOS — единственная платформа, где
 #     Kotlin/Native собирает Apple-таргеты (macosArm64/macosX64), и оттуда же
 #     кросс-собираются linuxX64/linuxArm64/mingwX64 (нужны только чужие
 #     jni_md.h). Так вся публикация уходит одним Sonatype-деплойментом.
@@ -71,7 +71,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     needs: test
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
